@@ -135,4 +135,11 @@ def parse_fasta(  # noqa: C901, PLR0912
     }
 
     name = path.stem
-    return parse_boltz_schema(name, data, ccd, mol_dir, boltz2)
+    return parse_boltz_schema(
+        name,
+        data,
+        ccd,
+        mol_dir,
+        boltz2,
+        base_path=path.parent,
+    )

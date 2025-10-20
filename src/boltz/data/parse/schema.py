@@ -1,11 +1,13 @@
 from collections.abc import Mapping
 from dataclasses import dataclass
+from collections import defaultdict
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 import click
 import numpy as np
-from Bio import Align
+import pandas as pd
+from Bio import Align, pairwise2
 from chembl_structure_pipeline.exclude_flag import exclude_flag
 from chembl_structure_pipeline.standardizer import standardize_mol
 from rdkit import Chem, rdBase
@@ -49,6 +51,347 @@ from boltz.data.types import (
     Target,
     TemplateInfo,
 )
+
+AA_ALPHABET = list("ACDEFGHIKLMNPQRSTVWY")
+LOG_ALPHA = np.log2(len(AA_ALPHABET) + 1)
+
+
+def _clean_msa_sequence(raw_sequence: str) -> list[str]:
+    """Convert an MSA sequence into alignment columns.
+
+    Lowercase characters represent insertions relative to the query and are
+    ignored when building the column alignment. Uppercase amino-acid letters
+    and gaps are retained.
+
+    Parameters
+    ----------
+    raw_sequence : str
+        Raw sequence string from the MSA CSV.
+
+    Returns
+    -------
+    list[str]
+        Sequence aligned to the query columns.
+
+    """
+
+    columns: list[str] = []
+    for char in raw_sequence.strip():
+        if char != "-" and char.islower():
+            # Insertions are skipped but do not advance the column index.
+            continue
+        if char == "-":
+            columns.append("-")
+        else:
+            columns.append(char.upper())
+
+    return columns
+
+
+def _compute_query_conservation(msa_path: Path, query_sequence: str) -> np.ndarray:
+    """Compute per-residue conservation scores from an MSA CSV.
+
+    Parameters
+    ----------
+    msa_path : Path
+        Path to the MSA CSV file.
+    query_sequence : str
+        Query protein sequence.
+
+    Returns
+    -------
+    np.ndarray
+        Conservation score (0-1) for each residue in the query sequence.
+
+    """
+
+    data = pd.read_csv(msa_path)
+    if "sequence" not in data.columns:
+        msg = f"MSA file {msa_path} is missing the 'sequence' column"
+        raise ValueError(msg)
+
+    processed_sequences: list[list[str]] = []
+    query_index: Optional[int] = None
+
+    for idx, raw_sequence in enumerate(data["sequence"]):
+        if not isinstance(raw_sequence, str):
+            continue
+
+        aligned = _clean_msa_sequence(raw_sequence)
+        if not aligned:
+            continue
+        processed_sequences.append(aligned)
+
+        if query_index is None:
+            stripped = "".join(char for char in aligned if char != "-")
+            if stripped.upper() == query_sequence.upper():
+                query_index = len(processed_sequences) - 1
+
+    if not processed_sequences:
+        msg = f"MSA file {msa_path} does not contain valid sequences"
+        raise ValueError(msg)
+
+    alignment_lengths = {len(seq) for seq in processed_sequences}
+    if len(alignment_lengths) != 1:
+        msg = (
+            f"MSA file {msa_path} has inconsistent alignment lengths: "
+            f"{alignment_lengths}"
+        )
+        raise ValueError(msg)
+
+    if query_index is None:
+        msg = (
+            f"Could not locate the query sequence in MSA {msa_path}. "
+            "Ensure the query is present as an aligned sequence."
+        )
+        raise ValueError(msg)
+
+    alignment_length = alignment_lengths.pop()
+    column_scores = np.zeros(alignment_length, dtype=np.float32)
+
+    for col_idx in range(alignment_length):
+        counts: Dict[str, int] = {}
+        for seq in processed_sequences:
+            residue = seq[col_idx]
+            if residue == "-":
+                continue
+            counts[residue] = counts.get(residue, 0) + 1
+
+        total = sum(counts.values())
+        if total == 0:
+            column_scores[col_idx] = 0.0
+            continue
+
+        probabilities = np.array(list(counts.values()), dtype=np.float32) / total
+        entropy = -np.sum(probabilities * np.log2(probabilities))
+        column_scores[col_idx] = 1.0 - (entropy / LOG_ALPHA)
+
+    query_alignment = processed_sequences[query_index]
+    conservation = []
+    for idx, residue in enumerate(query_alignment):
+        if residue == "-":
+            continue
+        conservation.append(column_scores[idx])
+
+    if len(conservation) != len(query_sequence):
+        msg = (
+            f"MSA-derived conservation length {len(conservation)} does not match "
+            f"the query sequence length {len(query_sequence)} for {msa_path}"
+        )
+        raise ValueError(msg)
+
+    return np.asarray(conservation, dtype=np.float32)
+
+
+def _build_template_to_query_mapping(
+    template_sequence: str,
+    query_sequence: str,
+) -> Dict[int, int]:
+    """Map template residue indices to query residue indices using alignment."""
+
+    if not template_sequence or not query_sequence:
+        return {}
+
+    alignment = pairwise2.align.globalms(
+        template_sequence.upper(),
+        query_sequence.upper(),
+        2,
+        -1,
+        -0.5,
+        -0.1,
+        one_alignment_only=True,
+    )[0]
+
+    mapping: Dict[int, int] = {}
+    template_pos = 0
+    query_pos = 0
+    for template_char, query_char in zip(alignment.seqA, alignment.seqB):
+        if template_char != "-" and query_char != "-":
+            mapping[template_pos] = query_pos
+        if template_char != "-":
+            template_pos += 1
+        if query_char != "-":
+            query_pos += 1
+
+    return mapping
+
+
+def _find_template_ligand_contacts(
+    structure: StructureV2,
+    ligand_chain: str,
+    cutoff: float,
+) -> list[tuple[str, int, float]]:
+    """Identify template residues within ``cutoff`` Å of the ligand chain."""
+
+    ligand_chain = str(ligand_chain)
+    ligand_contacts: list[tuple[str, int, float]] = []
+
+    chain_names = [str(name).strip() for name in structure.chains["name"]]
+    try:
+        ligand_index = chain_names.index(ligand_chain)
+    except ValueError:
+        return []
+
+    ligand_chain_data = structure.chains[ligand_index]
+    ligand_atom_start = int(ligand_chain_data["atom_idx"])
+    ligand_atom_end = ligand_atom_start + int(ligand_chain_data["atom_num"])
+    ligand_atoms = structure.atoms[ligand_atom_start:ligand_atom_end]
+    ligand_coords = ligand_atoms["coords"][ligand_atoms["is_present"]]
+
+    if len(ligand_coords) == 0:
+        return []
+
+    protein_type = const.chain_type_ids["PROTEIN"]
+    for chain_data in structure.chains:
+        if int(chain_data["mol_type"]) != protein_type:
+            continue
+
+        protein_chain_name = str(chain_data["name"]).strip()
+        res_start = int(chain_data["res_idx"])
+        res_end = res_start + int(chain_data["res_num"])
+        residues = structure.residues[res_start:res_end]
+
+        for res_idx, residue in enumerate(residues):
+            atom_start = int(residue["atom_idx"])
+            atom_end = atom_start + int(residue["atom_num"])
+            residue_atoms = structure.atoms[atom_start:atom_end]
+            residue_coords = residue_atoms["coords"][residue_atoms["is_present"]]
+
+            if len(residue_coords) == 0:
+                continue
+
+            diffs = ligand_coords[:, None, :] - residue_coords[None, :, :]
+            distances = np.sqrt(np.sum(diffs * diffs, axis=-1))
+            min_distance = float(np.min(distances))
+
+            if min_distance <= cutoff:
+                ligand_contacts.append((protein_chain_name, res_idx, min_distance))
+
+    return ligand_contacts
+
+
+def _infer_pocket_constraints_from_templates(
+    ligand_chains: list[str],
+    templates: dict[str, StructureV2],
+    template_sequences: dict[str, dict[str, str]],
+    template_records: list[TemplateInfo],
+    protein_sequences: dict[str, str],
+    chain_to_msa: dict[str, str],
+    base_path: Path,
+    contact_cutoff: float = 6.0,
+    max_contacts: int = 24,
+) -> list[tuple[str, list[tuple[str, int]], float, bool]]:
+    """Automatically derive pocket constraints from templates and MSAs."""
+
+    if not ligand_chains or not templates:
+        return []
+
+    template_chain_to_query: dict[str, dict[str, str]] = defaultdict(dict)
+    for record in template_records:
+        template_chain_to_query[record.name][record.template_chain] = record.query_chain
+
+    template_chain_mappings: dict[str, dict[str, Dict[int, int]]] = defaultdict(dict)
+    for template_id, chain_map in template_chain_to_query.items():
+        sequences = template_sequences.get(template_id, {})
+        for template_chain, query_chain in chain_map.items():
+            template_sequence = sequences.get(template_chain, "")
+            query_sequence = protein_sequences.get(query_chain, "")
+            mapping = _build_template_to_query_mapping(template_sequence, query_sequence)
+            if mapping:
+                template_chain_mappings[template_id][template_chain] = mapping
+
+    msa_cache: dict[Path, np.ndarray] = {}
+    chain_conservation: dict[str, np.ndarray] = {}
+
+    def get_chain_conservation(chain_id: str) -> Optional[np.ndarray]:
+        conservation = chain_conservation.get(chain_id)
+        if conservation is not None:
+            return conservation
+
+        msa_ref = chain_to_msa.get(chain_id)
+        if not isinstance(msa_ref, (str, Path)) or str(msa_ref) in {"", "0"}:
+            return None
+
+        msa_path = Path(msa_ref)
+        if not msa_path.is_absolute():
+            msa_path = (base_path / msa_path).resolve()
+
+        conservation = msa_cache.get(msa_path)
+        if conservation is None:
+            if not msa_path.exists():
+                msg = f"MSA file {msa_path} referenced for chain {chain_id} was not found"
+                raise FileNotFoundError(msg)
+
+            conservation = _compute_query_conservation(msa_path, protein_sequences[chain_id])
+            msa_cache[msa_path] = conservation
+
+        chain_conservation[chain_id] = conservation
+        return conservation
+
+    pocket_constraints: list[tuple[str, list[tuple[str, int]], float, bool]] = []
+
+    for ligand_chain in ligand_chains:
+        contact_scores: dict[tuple[str, int], dict[str, float]] = {}
+
+        for template_id, structure in templates.items():
+            contacts = _find_template_ligand_contacts(structure, ligand_chain, contact_cutoff)
+            if not contacts:
+                continue
+
+            chain_map = template_chain_to_query.get(template_id, {})
+            mappings = template_chain_mappings.get(template_id, {})
+
+            for template_chain, template_res_idx, distance in contacts:
+                query_chain = chain_map.get(template_chain)
+                if query_chain is None:
+                    continue
+
+                mapping = mappings.get(template_chain)
+                if mapping is None:
+                    continue
+
+                query_res_idx = mapping.get(template_res_idx)
+                if query_res_idx is None:
+                    continue
+
+                conservation = get_chain_conservation(query_chain)
+                if conservation is None or query_res_idx >= len(conservation):
+                    continue
+
+                key = (query_chain, query_res_idx)
+                score = float(conservation[query_res_idx])
+                existing = contact_scores.get(key)
+                if (
+                    existing is None
+                    or score > existing["score"]
+                    or (
+                        score == existing["score"]
+                        and distance < existing["distance"]
+                    )
+                ):
+                    contact_scores[key] = {"score": score, "distance": distance}
+
+        if not contact_scores:
+            continue
+
+        sorted_contacts = sorted(
+            contact_scores.items(),
+            key=lambda item: (
+                -item[1]["score"],
+                item[1]["distance"],
+                item[0][0],
+                item[0][1],
+            ),
+        )
+
+        formatted_contacts = [
+            (chain_id, residue_idx + 1)
+            for (chain_id, residue_idx), _ in sorted_contacts[:max_contacts]
+        ]
+
+        pocket_constraints.append((ligand_chain, formatted_contacts, contact_cutoff, False))
+
+    return pocket_constraints
 
 ####################################################################################################
 # DATACLASSES
@@ -944,6 +1287,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
     ccd: Mapping[str, Mol],
     mol_dir: Optional[Path] = None,
     boltz_2: bool = False,
+    base_path: Optional[Path] = None,
 ) -> Target:
     """Parse a Boltz input yaml / json.
 
@@ -1002,6 +1346,9 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
         The parsed target.
 
     """
+    if base_path is None:
+        base_path = Path(".")
+
     # Assert version 1
     version = schema.get("version", 1)
     if version != 1:
@@ -1640,6 +1987,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
 
     templates = {}
     template_records = []
+    template_sequences: dict[str, dict[str, str]] = {}
     for template in template_schema:
         if "cif" in template:
             path = template["cif"]
@@ -1651,7 +1999,15 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
             msg = "Template was not properly specified, missing CIF or PDB path!"
             raise ValueError(msg)
 
-        template_id = Path(path).stem
+        template_path = Path(path)
+        if not template_path.is_absolute():
+            template_path = (base_path / template_path).resolve()
+
+        if not template_path.exists():
+            msg = f"Template file {template_path} was not found"
+            raise FileNotFoundError(msg)
+
+        template_id = template_path.stem
         chain_ids = template.get("chain_id", None)
         template_chain_ids = template.get("template_id", None)
 
@@ -1693,7 +2049,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
         # Get relevant template chain ids
         if pdb:
             parsed_template = parse_pdb(
-                path,
+                str(template_path),
                 mols=ccd,
                 moldir=mol_dir,
                 use_assembly=False,
@@ -1701,7 +2057,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
             )
         else:
             parsed_template = parse_mmcif(
-                path,
+                str(template_path),
                 mols=ccd,
                 moldir=mol_dir,
                 use_assembly=False,
@@ -1760,6 +2116,25 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
             )
         # Save template
         templates[template_id] = parsed_template.data
+        template_sequences[template_id] = parsed_template.sequences
+
+    ligand_chains = [
+        chain_name
+        for chain_name, entity_type in chain_name_to_entity_type.items()
+        if entity_type == "ligand"
+    ]
+
+    if not pocket_constraints:
+        auto_pocket_constraints = _infer_pocket_constraints_from_templates(
+            ligand_chains=ligand_chains,
+            templates=templates,
+            template_sequences=template_sequences,
+            template_records=template_records,
+            protein_sequences=protein_seqs,
+            chain_to_msa=chain_to_msa,
+            base_path=base_path,
+        )
+        pocket_constraints.extend(auto_pocket_constraints)
 
     # Convert into datatypes
     residues = np.array(res_data, dtype=Residue)
