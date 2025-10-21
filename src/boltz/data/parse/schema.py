@@ -1,10 +1,12 @@
 from collections.abc import Mapping
 from dataclasses import dataclass
+from collections import defaultdict
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 import click
 import numpy as np
+import pandas as pd
 from Bio import Align
 from chembl_structure_pipeline.exclude_flag import exclude_flag
 from chembl_structure_pipeline.standardizer import standardize_mol
@@ -20,6 +22,11 @@ from boltz.data import const
 from boltz.data.mol import load_molecules
 from boltz.data.parse.mmcif import parse_mmcif
 from boltz.data.parse.pdb import parse_pdb
+from boltz.utils.msa import compute_query_conservation
+from boltz.utils.pockets import (
+    build_template_to_query_mapping,
+    find_template_ligand_contacts,
+)
 
 from boltz.data.types import (
     AffinityInfo,
@@ -49,6 +56,129 @@ from boltz.data.types import (
     Target,
     TemplateInfo,
 )
+
+def _infer_pocket_constraints_from_templates(
+    ligand_chains: list[str],
+    templates: dict[str, StructureV2],
+    template_sequences: dict[str, dict[str, str]],
+    template_records: list[TemplateInfo],
+    protein_sequences: dict[str, str],
+    chain_to_msa: dict[str, str],
+    base_path: Path,
+    contact_cutoff: float = 6.0,
+    max_contacts: int = 24,
+) -> list[tuple[str, list[tuple[str, int]], float, bool]]:
+    """Automatically derive pocket constraints from templates and MSAs."""
+
+    if not ligand_chains or not templates:
+        return []
+
+    template_chain_to_query: dict[str, dict[str, str]] = defaultdict(dict)
+    for record in template_records:
+        template_chain_to_query[record.name][record.template_chain] = record.query_chain
+
+    template_chain_mappings: dict[str, dict[str, Dict[int, int]]] = defaultdict(dict)
+    for template_id, chain_map in template_chain_to_query.items():
+        sequences = template_sequences.get(template_id, {})
+        for template_chain, query_chain in chain_map.items():
+            template_sequence = sequences.get(template_chain, "")
+            query_sequence = protein_sequences.get(query_chain, "")
+            mapping = build_template_to_query_mapping(template_sequence, query_sequence)
+            if mapping:
+                template_chain_mappings[template_id][template_chain] = mapping
+
+    msa_cache: dict[Path, np.ndarray] = {}
+    chain_conservation: dict[str, np.ndarray] = {}
+
+    def get_chain_conservation(chain_id: str) -> Optional[np.ndarray]:
+        conservation = chain_conservation.get(chain_id)
+        if conservation is not None:
+            return conservation
+
+        msa_ref = chain_to_msa.get(chain_id)
+        if not isinstance(msa_ref, (str, Path)) or str(msa_ref) in {"", "0"}:
+            return None
+
+        msa_path = Path(msa_ref)
+        if not msa_path.is_absolute():
+            msa_path = (base_path / msa_path).resolve()
+
+        conservation = msa_cache.get(msa_path)
+        if conservation is None:
+            if not msa_path.exists():
+                msg = f"MSA file {msa_path} referenced for chain {chain_id} was not found"
+                raise FileNotFoundError(msg)
+
+            conservation = compute_query_conservation(msa_path, protein_sequences[chain_id])
+            msa_cache[msa_path] = conservation
+
+        chain_conservation[chain_id] = conservation
+        return conservation
+
+    pocket_constraints: list[tuple[str, list[tuple[str, int]], float, bool]] = []
+
+    for ligand_chain in ligand_chains:
+        contact_scores: dict[tuple[str, int], dict[str, float]] = {}
+
+        for template_id, structure in templates.items():
+            contacts = find_template_ligand_contacts(structure, ligand_chain, contact_cutoff)
+            if not contacts:
+                continue
+
+            chain_map = template_chain_to_query.get(template_id, {})
+            mappings = template_chain_mappings.get(template_id, {})
+
+            for template_chain, template_res_idx, distance in contacts:
+                query_chain = chain_map.get(template_chain)
+                if query_chain is None:
+                    continue
+
+                mapping = mappings.get(template_chain)
+                if mapping is None:
+                    continue
+
+                query_res_idx = mapping.get(template_res_idx)
+                if query_res_idx is None:
+                    continue
+
+                conservation = get_chain_conservation(query_chain)
+                if conservation is None or query_res_idx >= len(conservation):
+                    continue
+
+                key = (query_chain, query_res_idx)
+                score = float(conservation[query_res_idx])
+                existing = contact_scores.get(key)
+                if (
+                    existing is None
+                    or score > existing["score"]
+                    or (
+                        score == existing["score"]
+                        and distance < existing["distance"]
+                    )
+                ):
+                    contact_scores[key] = {"score": score, "distance": distance}
+
+        if not contact_scores:
+            continue
+
+        sorted_contacts = sorted(
+            contact_scores.items(),
+            key=lambda item: (
+                -item[1]["score"],
+                item[1]["distance"],
+                item[0][0],
+                item[0][1],
+            ),
+        )
+
+        formatted_contacts = [
+            (chain_id, residue_idx + 1)
+            for (chain_id, residue_idx), _ in sorted_contacts[:max_contacts]
+        ]
+
+        pocket_constraints.append((ligand_chain, formatted_contacts, contact_cutoff, False))
+
+    return pocket_constraints
 
 ####################################################################################################
 # DATACLASSES
@@ -944,6 +1074,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
     ccd: Mapping[str, Mol],
     mol_dir: Optional[Path] = None,
     boltz_2: bool = False,
+    base_path: Optional[Path] = None,
 ) -> Target:
     """Parse a Boltz input yaml / json.
 
@@ -1002,6 +1133,9 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
         The parsed target.
 
     """
+    if base_path is None:
+        base_path = Path(".")
+
     # Assert version 1
     version = schema.get("version", 1)
     if version != 1:
@@ -1640,6 +1774,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
 
     templates = {}
     template_records = []
+    template_sequences: dict[str, dict[str, str]] = {}
     for template in template_schema:
         if "cif" in template:
             path = template["cif"]
@@ -1651,7 +1786,15 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
             msg = "Template was not properly specified, missing CIF or PDB path!"
             raise ValueError(msg)
 
-        template_id = Path(path).stem
+        template_path = Path(path)
+        if not template_path.is_absolute():
+            template_path = (base_path / template_path).resolve()
+
+        if not template_path.exists():
+            msg = f"Template file {template_path} was not found"
+            raise FileNotFoundError(msg)
+
+        template_id = template_path.stem
         chain_ids = template.get("chain_id", None)
         template_chain_ids = template.get("template_id", None)
 
@@ -1693,7 +1836,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
         # Get relevant template chain ids
         if pdb:
             parsed_template = parse_pdb(
-                path,
+                str(template_path),
                 mols=ccd,
                 moldir=mol_dir,
                 use_assembly=False,
@@ -1701,7 +1844,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
             )
         else:
             parsed_template = parse_mmcif(
-                path,
+                str(template_path),
                 mols=ccd,
                 moldir=mol_dir,
                 use_assembly=False,
@@ -1760,6 +1903,25 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
             )
         # Save template
         templates[template_id] = parsed_template.data
+        template_sequences[template_id] = parsed_template.sequences
+
+    ligand_chains = [
+        chain_name
+        for chain_name, entity_type in chain_name_to_entity_type.items()
+        if entity_type == "ligand"
+    ]
+
+    if not pocket_constraints:
+        auto_pocket_constraints = _infer_pocket_constraints_from_templates(
+            ligand_chains=ligand_chains,
+            templates=templates,
+            template_sequences=template_sequences,
+            template_records=template_records,
+            protein_sequences=protein_seqs,
+            chain_to_msa=chain_to_msa,
+            base_path=base_path,
+        )
+        pocket_constraints.extend(auto_pocket_constraints)
 
     # Convert into datatypes
     residues = np.array(res_data, dtype=Residue)

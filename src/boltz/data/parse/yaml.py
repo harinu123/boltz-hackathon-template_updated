@@ -65,4 +65,11 @@ def parse_yaml(
         data = yaml.safe_load(file)
 
     name = path.stem
-    return parse_boltz_schema(name, data, ccd, mol_dir, boltz2)
+    return parse_boltz_schema(
+        name,
+        data,
+        ccd,
+        mol_dir,
+        boltz2,
+        base_path=path.parent,
+    )
